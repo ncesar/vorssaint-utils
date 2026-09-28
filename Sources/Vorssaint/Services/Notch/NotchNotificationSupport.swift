@@ -86,6 +86,16 @@ enum NotchNotificationSupport {
         return matches.count == 1 ? matches.first : nil
     }
 
+    /// Many messages arrive while their app is closed, so installed apps can
+    /// name a source too. A running match wins; otherwise the name must stay
+    /// unambiguous across both lists.
+    static func sourceBundleIdentifier(for names: [String],
+                                       running: [(name: String, bundleIdentifier: String)],
+                                       installed: [(name: String, bundleIdentifier: String)]) -> String? {
+        sourceBundleIdentifier(for: names, applications: running)
+            ?? sourceBundleIdentifier(for: names, applications: running + installed)
+    }
+
     /// Native formatted descriptions include the app before the same labelled
     /// message fields. Remove that exact suffix rather than splitting names or
     /// message text at commas, which may be part of their content.
@@ -140,6 +150,34 @@ enum NotchNotificationSupport {
               identifier.range(of: "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
                                options: .regularExpression) != nil else { return nil }
         return identifier
+    }
+}
+
+/// The banner beside the camera: the app's icon and title on one side, the
+/// message on the other. Both sides take the width the longer one needs, so
+/// a short message leaves no band of empty black at the ends, while a long
+/// one keeps the widest banner and wraps or truncates within it.
+enum NotchNotificationBannerLayout {
+    static let iconSize: CGFloat = 22
+    static let spacing: CGFloat = 8
+    static let wingRange: ClosedRange<CGFloat> = 88...190
+    /// The inset from the island's curved end, and a little air so the
+    /// fitted text never truncates where SwiftUI rounds its width.
+    static let inset: CGFloat = 16
+    static let air: CGFloat = 6
+    /// The fonts the banner draws with, so it is measured in the same ones.
+    static let titleFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+    static let messageFont = NSFont.systemFont(ofSize: 11)
+
+    static func wing(for content: NotchNotificationContent) -> CGFloat {
+        func width(_ text: String, _ font: NSFont) -> CGFloat {
+            // A line or two is all the banner shows, and the widest wing is
+            // reached long before this much text.
+            (String(text.prefix(240)) as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
+        }
+        let title = iconSize + spacing + width(content.compactTitle, titleFont)
+        let detail = width(content.compactDetail, messageFont)
+        return min(wingRange.upperBound, max(wingRange.lowerBound, max(title, detail) + inset + air))
     }
 }
 

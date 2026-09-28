@@ -30,11 +30,12 @@ enum MixerInputVolumeContract {
         }
     }
     enum AppFeature {
-        case mixer, micMute
+        case mixer, audioPriority, micMute
         var isAvailable: Bool { true }
     }
     enum DefaultsKey {
         static let preferredInputDevice = "preferred"
+        static let audioPriorityInputEnabled = "audioPriorityInputEnabled"
         static let micMuteActive = "mute"
         static let micMuteSavedVolumes = "savedVolumes"
         static let micMuteSavedChannelVolumes = "savedChannelVolumes"
@@ -70,6 +71,18 @@ enum MixerInputVolumeContract {
     enum QuickToolHUD {
         static var messages: [String] = []
         static func show(icon: String, message: String) { messages.append(message) }
+    }
+    final class NotchService {
+        static let shared = NotchService()
+        var showsMicrophone = false
+        var microphone: [Bool] = []
+        func showMicrophone(muted: Bool) -> Bool {
+            guard showsMicrophone else { return false }
+            microphone.append(muted)
+            return true
+        }
+        var retractions = 0
+        func retractMicrophoneNotice() { retractions += 1 }
     }
     enum L10n {
         static let shared = Strings()
@@ -486,6 +499,40 @@ enum MixerInputVolumeContract {
         m.stop()
         check(HAL.current == 10, "stop restores original input selection")
 
+        // Audio device priority: a microphone it puts in use becomes the
+        // system's own choice, so quitting leaves it there. Only a change made
+        // by the saved preferred microphone is undone.
+        func priorityManager() -> AudioInputDeviceManager {
+            HAL.reset()
+            HAL.devices = [10, 20, 30]
+            HAL.levels[HAL.key(10)] = 0.5
+            HAL.levels[HAL.key(20)] = 0.5
+            HAL.levels[HAL.key(30)] = 0.5
+            let m = manager()
+            m.setInputPriorityActive(true)
+            DispatchQueue.drain()
+            m.setCurrentInputDeviceUID("device-20")
+            DispatchQueue.drain()
+            return m
+        }
+        m = priorityManager()
+        check(HAL.current == 20, "a priority pick becomes the system input")
+        m.stop()
+        check(HAL.current == 20, "quitting keeps the microphone the priority list picked")
+        m = priorityManager()
+        m.setInputPriorityActive(false)
+        DispatchQueue.drain()
+        m.stop()
+        check(HAL.current == 20, "turning priority off does not make quitting undo its pick")
+        m = priorityManager()
+        m.setInputPriorityActive(false)
+        DispatchQueue.drain()
+        m.setPreferredInputDeviceUID("device-30")
+        DispatchQueue.drain()
+        check(HAL.current == 30, "the saved preferred microphone takes over once priority is off")
+        m.stop()
+        check(HAL.current == 20, "quitting then goes back to the microphone the priority list picked")
+
         HAL.reset()
         HAL.levels[HAL.key(10)] = 0.6
         m = manager()
@@ -708,6 +755,35 @@ enum MixerInputVolumeContract {
         check(
             QuickToolHUD.messages == ["muted"] && MicMuteService.isSilenced(10),
             "an idle microphone with no mute or level of its own does not make the mute partial")
+        HAL.reset()
+        HAL.levels[HAL.key(10)] = 0.5
+        NotchService.shared.showsMicrophone = true
+        QuickToolHUD.messages = []
+        MicMuteService.shared.setMuted(true)
+        DispatchQueue.drain()
+        MicMuteService.shared.setMuted(false)
+        DispatchQueue.drain()
+        check(
+            QuickToolHUD.messages.isEmpty && NotchService.shared.microphone == [true, false],
+            "with Dynamic Island showing it, the switch reports there instead of a floating confirmation")
+        HAL.reset()
+        HAL.devices = [10, 20]
+        HAL.levels[HAL.key(10)] = 0.5
+        HAL.levels[HAL.key(20)] = 0.5
+        HAL.readOnly.insert(HAL.key(20))
+        HAL.running = [20]
+        NotchService.shared.microphone = []
+        NotchService.shared.retractions = 0
+        QuickToolHUD.messages = []
+        MicMuteService.shared.setMuted(true)
+        DispatchQueue.drain()
+        check(
+            QuickToolHUD.messages == ["mute partial"] && NotchService.shared.microphone.isEmpty,
+            "a microphone left open keeps its whole warning in the floating confirmation")
+        check(NotchService.shared.retractions == 1,
+              "a partial result takes back the island notice of the press before it")
+        NotchService.shared.showsMicrophone = false
+        NotchService.shared.microphone = []
         HAL.reset()
         HAL.levels[HAL.key(10)] = 0.5
         HAL.levels[HAL.key(10, 1)] = 1

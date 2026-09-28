@@ -328,7 +328,7 @@ final class QuickLauncherService: ObservableObject {
     /// Borderless panels refuse key status by default, and the launcher needs
     /// it for arrows, digits and Esc. Borderless also removes the invisible
     /// title-bar strip that would swallow clicks on the header controls.
-    private final class KeyableLauncherPanel: NSPanel {
+    private final class KeyableLauncherPanel: OverlayPanel {
         override var canBecomeKey: Bool { true }
     }
 
@@ -376,6 +376,10 @@ final class QuickLauncherService: ObservableObject {
     func handlePanelKey(_ event: NSEvent,
                         flow: QuickToolsSupport.GridFlow = .rows(columns: QuickLauncherService.columns)) -> NSEvent? {
         if event.keyCode == UInt16(kVK_Escape) {
+            // While an input method is composing in a utility's field, Esc
+            // belongs to it and drops the candidate; the launcher takes the
+            // next one.
+            if (event.window?.firstResponder as? NSTextView)?.hasMarkedText() == true { return event }
             if activeUtility != nil {
                 activeUtility = nil
             } else if editingOptionsItem != nil {

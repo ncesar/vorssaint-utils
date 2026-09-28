@@ -529,13 +529,16 @@ enum CommandBarCatalog {
             numericRange: 0...100,
             run: { value in
                 guard let value else { return }
-                let applied = AppVolumeMixer.setSystemOutputVolume(Double(value) / 100)
-                if applied {
-                    QuickToolHUD.show(icon: "speaker.wave.2",
-                                      message: "\(FeatureStrings.commandBar(L10n.shared.language).volumeTitle) \(value)%")
-                } else {
+                let level = Double(value) / 100
+                guard AppVolumeMixer.setSystemOutputVolume(level) else {
                     NSSound.beep()
+                    return
                 }
+                // Dynamic Island shows the level itself, and a floating copy
+                // would sit right below it.
+                if NotchSupport.routes(.volume), NotchService.shared.showVolume(level) { return }
+                QuickToolHUD.show(icon: "speaker.wave.2",
+                                  message: "\(FeatureStrings.commandBar(L10n.shared.language).volumeTitle) \(value)%")
             }))
         }
 
@@ -845,6 +848,12 @@ enum CommandBarCatalog {
                         item.destination.page, isAvailable: { $0.isAvailable })
                 else { return nil }
                 id = "settings.feature.\(feature.rawValue)"
+            case .setting(let anchor):
+                guard item.feature.map(\.isAvailable) ?? true,
+                      FeatureVisibilitySupport.isPageVisible(
+                        item.destination.page, isAvailable: { $0.isAvailable })
+                else { return nil }
+                id = "settings.setting.\(anchor.rawValue)"
             }
             return CommandBarEntry(
                 id: id,
@@ -854,7 +863,8 @@ enum CommandBarCatalog {
                 icon: .symbol(item.icon),
                 run: { _ in
                     let routed = SettingsSearchSupport.route(for: item)
-                    openSettings(at: routed.destination, targetFeature: routed.targetFeature)
+                    openSettings(at: routed.destination, targetFeature: routed.targetFeature,
+                                 sidebarFeature: item.feature)
                 })
         }
     }
@@ -1710,8 +1720,10 @@ enum CommandBarCatalog {
     }
 
     private static func openSettings(at destination: FeatureSettingsDestination,
-                                     targetFeature: AppFeature? = nil) {
-        SettingsRouter.shared.request(destination, targetFeature: targetFeature)
+                                     targetFeature: AppFeature? = nil,
+                                     sidebarFeature: AppFeature? = nil) {
+        SettingsRouter.shared.request(destination, targetFeature: targetFeature,
+                                      sidebarFeature: sidebarFeature)
         appDelegate()?.openSettingsWindow()
     }
 
