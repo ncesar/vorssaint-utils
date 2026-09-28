@@ -506,6 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             guard let self,
                   let button,
                   self.popover.isShown,
+                  !self.popover.isDetached,
                   self.metricAnchorSwitchSerial == serial,
                   MenuPanelFocus.shared.activeMetric == detailKind else { return }
             self.reanchorMetricPopover(to: detailKind, anchoredTo: button)
@@ -518,6 +519,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             showPopover(anchor: button, allowRecentClose: true, animate: false, activate: false)
             return
         }
+        let serial = metricAnchorSwitchSerial
         popoverIsSwitchingAnchor = true
         MenuPanelFocus.shared.setSwitchingMetricAnchor(true)
         let expectedMidX = statusButtonMidX(button)
@@ -541,7 +543,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             }
             guard let button,
                   self.popover.isShown,
-                  self.metricAnchorSwitchSerial > 0,
+                  !self.popover.isDetached,
+                  self.metricAnchorSwitchSerial == serial,
                   MenuPanelFocus.shared.activeMetric == detailKind else {
                 self.popoverIsSwitchingAnchor = false
                 MenuPanelFocus.shared.setSwitchingMetricAnchor(false)
@@ -1226,7 +1229,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     }
 
     func popoverDidDetach(_ popover: NSPopover) {
-        // The anchor would keep pulling the panel back under the icon.
+        // The anchor, or a metric switch still waiting to run, would pull the
+        // panel back under the icon.
+        metricAnchorSwitchSerial &+= 1
         endPopoverDriftCorrection()
         PanelInteractionState.shared.isDetached = true
     }

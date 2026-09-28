@@ -12,6 +12,7 @@ enum MenuPanelRecoveryTests {
     final class Queue {
         var jobs: [() -> Void] = []
         func async(execute work: @escaping () -> Void) { jobs.append(work) }
+        func asyncAfter(deadline: DispatchTime, execute work: @escaping () -> Void) { jobs.append(work) }
         func drain() { while !jobs.isEmpty { jobs.removeFirst()() } }
     }
     enum DispatchQueue { static var main = Queue() }
@@ -59,6 +60,7 @@ enum MenuPanelRecoveryTests {
     final class Popover {
         var animates = true
         var isShown = false
+        var isDetached = false
         var contentViewController: Controller? = Controller()
         var fails = false
         var attempts = 0
@@ -74,6 +76,8 @@ enum MenuPanelRecoveryTests {
             isShown = true
         }
     }
+    typealias NSPopover = Popover
+    typealias MetricDetailKind = String
     final class Center {
         var observers: [(NSObject, Any?, (Notification) -> Void)] = []
         func addObserver(forName: Notification.Name, object: Any?, queue: OperationQueue?,
@@ -105,6 +109,7 @@ enum MenuPanelRecoveryTests {
         var popoverIsVisible = false
         func setSwitchingMetricAnchor(_ value: Bool) { switching = value }
         func setPopoverVisible(_ value: Bool) { popoverIsVisible = value }
+        func focus(_ metric: String) { activeMetric = metric }
         func clearMetricFocus() { activeMetric = nil }
     }
     enum Needs { case none, network }
@@ -159,6 +164,7 @@ enum MenuPanelRecoveryTests {
         var popoverLastWindowNumber: Int?
         var popoverForeignReopenAt = Date.distantPast
         var popoverClosedAt = Date.distantPast
+        var metricAnchorSwitchSerial = 0
         var lastStatusClick: (point: NSPoint, at: Date)?
         static let statusClickFreshness: TimeInterval = 0.5
         static let statusClickEventTypes: Set<NSEvent.EventType> = [
@@ -507,6 +513,30 @@ enum MenuPanelRecoveryTests {
             host.popoverIsSwitchingAnchor = true; requestClose(host, .statusItem)
             expect(host.handbackReasons.isEmpty && host.activationTracking,
                    "moving the panel between metric anchors keeps activation and its tracking")
+        }
+        do {
+            let host = setup()
+            let button = host.statusController.button!
+            MenuPanelFocus.shared.focus("cpu")
+            host.scheduleMetricAnchorSwitch(to: "cpu", anchoredTo: button)
+            host.popover.isDetached = true
+            host.popoverDidDetach(host.popover)
+            DispatchQueue.main.drain()
+            expect(host.popover.attempts == 1 && host.popoverAnchor == nil && host.popoverDriftObservers.isEmpty,
+                   "a metric switch waiting when the panel detaches neither reanchors it nor restarts drift correction")
+        }
+        do {
+            let host = setup()
+            let button = host.statusController.button!
+            host.metricAnchorSwitchSerial = 1
+            host.reanchorMetricPopover(to: "network", anchoredTo: button)
+            host.popover.isDetached = true
+            host.popoverDidDetach(host.popover)
+            host.popover.contentViewController!.view.window!.frame.origin.x = 100
+            DispatchQueue.main.drain()
+            expect(host.popover.isShown && host.popover.attempts == 2
+                   && !host.popoverIsSwitchingAnchor && !MenuPanelFocus.shared.switching,
+                   "a reanchor check waiting when the panel detaches does not close and reopen it")
         }
     }
 }
