@@ -1245,6 +1245,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 
     func popoverWillClose(_ notification: Notification) {
         popoverIsClosing = true
+        // Only its own close button closes a detached panel without us asking.
+        if !popoverCloseIsAppRequested, PanelInteractionState.shared.isDetached {
+            popoverCloseReason = .closeButton
+        }
         if !popoverIsSwitchingAnchor {
             popoverClosedAt = Date()
         }
