@@ -1212,6 +1212,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         // panel back under the icon.
         metricAnchorSwitchSerial &+= 1
         endPopoverDriftCorrection()
+        // The badge was held so the icon's width would not move a panel
+        // hanging from it; a detached panel no longer does.
+        statusController.setMicBadgeHeld(false)
         PanelInteractionState.shared.isDetached = true
     }
 

@@ -532,6 +532,7 @@ enum MenuPanelRecoveryTests {
             DispatchQueue.main.drain()
             expect(host.popover.attempts == 1 && host.popoverAnchor == nil && host.popoverDriftObservers.isEmpty,
                    "a metric switch waiting when the panel detaches neither reanchors it nor restarts drift correction")
+            expect(!host.statusController.held, "a detached panel stops holding the microphone badge")
         }
         do {
             let host = setup()
