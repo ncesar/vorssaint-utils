@@ -485,6 +485,14 @@ enum MenuPanelRecoveryTests {
         }
         do {
             let host = setup()
+            host.popover.isDetached = true
+            host.popoverDidDetach(host.popover)
+            close(host)
+            expect(!host.popover.isShown && host.handbackReasons == [.closeButton],
+                   "a detached panel's close button hands activation back like Esc")
+        }
+        do {
+            let host = setup()
             expect(host.activationTrackingStarts == 0, "a panel shown without activating remembers no app")
             requestClose(host, .escape)
             host.showPopover(allowRecentClose: true, animate: false)
