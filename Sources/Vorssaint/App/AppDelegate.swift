@@ -1236,6 +1236,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         // The badge was held so the icon's width would not move a panel
         // hanging from it; a detached panel no longer does.
         statusController.setMicBadgeHeld(false)
+        // AppKit moves the content into a window of its own for the detached
+        // state, which starts without the popover window's setup.
+        if let window = popover.contentViewController?.view.window {
+            configurePopoverWindow(window)
+        }
         PanelInteractionState.shared.isDetached = true
     }
 

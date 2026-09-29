@@ -189,7 +189,8 @@ enum MenuPanelRecoveryTests {
             handbackReasons.append(closeReason)
         }
         func closePopover() { popover.isShown = false }
-        func configurePopoverWindow(_ window: NSWindow) {}
+        var configuredWindows: [NSWindow] = []
+        func configurePopoverWindow(_ window: NSWindow) { configuredWindows.append(window) }
         func animatePopoverOpen(_ window: NSWindow) {}
         @discardableResult func useStablePopoverPositioningViewIfNeeded(_ window: NSWindow) -> Bool { false }
     }
@@ -528,7 +529,11 @@ enum MenuPanelRecoveryTests {
             MenuPanelFocus.shared.focus("cpu")
             host.scheduleMetricAnchorSwitch(to: "cpu", anchoredTo: button)
             host.popover.isDetached = true
+            host.configuredWindows.removeAll()
             host.popoverDidDetach(host.popover)
+            expect(host.configuredWindows.count == 1
+                   && host.configuredWindows.first === host.popover.contentViewController?.view.window,
+                   "the detached panel's window keeps every desktop and full screen setup")
             DispatchQueue.main.drain()
             expect(host.popover.attempts == 1 && host.popoverAnchor == nil && host.popoverDriftObservers.isEmpty,
                    "a metric switch waiting when the panel detaches neither reanchors it nor restarts drift correction")
