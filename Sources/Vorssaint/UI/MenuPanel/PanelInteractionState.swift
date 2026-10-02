@@ -32,6 +32,7 @@ final class PanelInteractionState {
         viewKeepsPopoverOpen
             || isDetached
             || isPresentingPopoverModal
+            || AirPlayRouteManager.isPresentingPicker
             || HomebrewManager.shared.operationStatus?.isActive == true
             || cleanerIsRunning
             || uninstallerIsRunning
