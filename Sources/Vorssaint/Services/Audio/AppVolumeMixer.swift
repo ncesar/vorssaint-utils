@@ -1521,6 +1521,7 @@ final class AppVolumeMixer: ObservableObject {
                                      audioObjects: audioObjects,
                                      isPlaying: existing.isPlaying || app.isPlaying,
                                      isBypassed: existing.isBypassed || app.isBypassed,
+                                     isBypassOverridden: existing.isBypassOverridden || app.isBypassOverridden,
                                      universalOutputRouteUID: existing.universalOutputRouteUID ?? app.universalOutputRouteUID,
                                      selectedOutputDeviceUID: existing.selectedOutputDeviceUID,
                                      effectiveOutputDeviceUID: existing.effectiveOutputDeviceUID,
@@ -1828,6 +1829,9 @@ final class AppVolumeMixer: ObservableObject {
     /// tapping Zoom could hang joining a call; the user opts in per app.
     func setMixerControl(_ enabled: Bool, for app: MixerApp) {
         guard let id = app.persistenceID else { return }
+        // An explicit choice is a fresh attempt: a tap that failed twice
+        // before must not keep this row from ever being built again.
+        engineRecovery.clear(app.id)
         var controlled = savedControlledBypassApps()
         if enabled { controlled.insert(id) } else { controlled.remove(id) }
         if controlled.isEmpty {
