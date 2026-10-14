@@ -5,8 +5,10 @@ import Darwin
 import Foundation
 
 /// What one log line says, reduced to the few facts the island keeps. Only
-/// usage counters, model names, times and folder names leave a line; prompts,
-/// replies and tool output are never decoded into anything that is stored.
+/// usage counters, model names, times and folder names leave a line, besides
+/// the identifiers of Claude's shell commands still running, held in memory
+/// only; prompts, replies and tool output are never decoded into anything
+/// that is stored.
 enum AgentLogEntry: Equatable {
     /// `key` identifies the response across duplicate lines and files.
     case usage(key: String, record: AgentUsageRecord, billable: AgentBillable)
@@ -50,6 +52,9 @@ struct AgentLogState: Equatable {
     var parentSession = ""
     /// OpenCode stores all sessions in one database, tracking per-session state.
     var openCodeSessions: [String: OpenCodeSessionState] = [:]
+    /// Claude's shell commands still waiting for their result, by tool call.
+    /// They run on the Mac, so the turn goes on without the network.
+    var runningCommands: Set<String> = []
 }
 
 /// Per-session turn and model tracking for OpenCode databases.
@@ -136,7 +141,25 @@ enum AgentLogParser {
         }
         // Tool results arrive inside a turn and can be large; while a turn is
         // open, the line only has to say that work goes on.
-        if state.turnOpen { return [.turnActive(nil)] }
+        if state.turnOpen {
+            if !state.runningCommands.isEmpty, let json = object(line), json["type"] as? String == "user",
+               json["isMeta"] as? Bool != true, json["isSidechain"] as? Bool != true {
+                let content = (json["message"] as? [String: Any])?["content"]
+                let results = (content as? [[String: Any]] ?? []).filter { $0["type"] as? String == "tool_result" }
+                if !results.isEmpty {
+                    // A result can quote other commands or contain a log.
+                    // Only its own call identifier completes that command.
+                    for result in results {
+                        if let id = result["tool_use_id"] as? String { state.runningCommands.remove(id) }
+                    }
+                } else {
+                    // A prompt inside an open turn, as when a session killed
+                    // in the middle of a command resumes, leaves it behind.
+                    state.runningCommands = []
+                }
+            }
+            return [.turnActive(nil)]
+        }
         // A subagent's prompts and tool output never open a turn, and its
         // tool output can be large: no need to decode it to know that.
         if contains(line, #""isSidechain":true"#) { return [] }
@@ -144,6 +167,7 @@ enum AgentLogParser {
               json["isMeta"] as? Bool != true, json["isSidechain"] as? Bool != true else { return [] }
         adopt(json, into: &state)
         state.turnOpen = true
+        state.runningCommands = []
         return [.turnBegan(timestamp(json["timestamp"]) ?? now)]
     }
 
@@ -186,8 +210,13 @@ enum AgentLogParser {
             if state.turnOpen { entries.append(.turnEnded(date, completed: !failed, duration: nil)) }
             state.turnOpen = false
         default:
-            if !state.turnOpen { entries.append(.turnBegan(date)) }
-            else { entries.append(.turnActive(date)) }
+            for block in message["content"] as? [[String: Any]] ?? []
+            where block["type"] as? String == "tool_use" && block["name"] as? String == "Bash" {
+                if let id = block["id"] as? String { state.runningCommands.insert(id) }
+            }
+            // Ahead of the usage, so a reply that opens the turn again, as
+            // after an offline end, counts toward it.
+            entries.insert(state.turnOpen ? .turnActive(date) : .turnBegan(date), at: 0)
             state.turnOpen = true
         }
         return entries
@@ -426,34 +455,6 @@ enum AgentLogParser {
             if let rawModel, !rawModel.isEmpty {
                 sessionState.model = native(rawModel)
             }
-            let tokensDict = json["tokens"] as? [String: Any] ?? [:]
-            let input = int(tokensDict["input"])
-            let output = int(tokensDict["output"])
-            let reasoning = int(tokensDict["reasoning"])
-            let cacheDict = tokensDict["cache"] as? [String: Any] ?? [:]
-            let cacheRead = int(cacheDict["read"])
-            let cacheWrite = int(cacheDict["write"])
-            let tokens = AgentTokens(input: input, cacheWrite: cacheWrite, cacheRead: cacheRead,
-                                     output: output + reasoning, reasoning: reasoning)
-            let billable = AgentBillable(tokens: tokens)
-            let priced = AgentPricing.cost(billable, model: sessionState.model)
-            let recordedCost = (json["cost"] as? NSNumber)?.doubleValue
-            let reportedCostVal = recordedCost ?? 0
-            // A model the list does not know costs what OpenCode recorded.
-            // Local and free models record zero, which stays an estimate so
-            // a price the list learns later still applies.
-            let cost: Double?
-            let isReported: Bool
-            if let calculated = priced.cost {
-                cost = calculated
-                isReported = false
-            } else if let recordedCost {
-                cost = recordedCost
-                isReported = recordedCost > 0
-            } else {
-                cost = nil
-                isReported = false
-            }
 
             let parentID = json["parentID"] as? String ?? ""
             let isAlreadyCompleted = (!id.isEmpty && sessionState.completedAssistantMessageIDs.contains(id))
@@ -490,17 +491,9 @@ enum AgentLogParser {
                 sessionState.turnStarted = date
                 entries.append(.turnBegan(date))
             }
-            // A reply is saved before its answer arrives, and a shell command
-            // run from the prompt, the reply that hands work to a subtask and
-            // a request that failed or was stopped never hold any usage.
-            if tokens.total > 0 || reportedCostVal > 0 {
-                let key = "opencode:\(sessionID):\(id.isEmpty ? "\(date.timeIntervalSince1970)" : id)"
-                let record = AgentUsageRecord(
-                    provider: .opencode, date: date, model: sessionState.model, project: sessionState.project,
-                    session: sessionID, tokens: tokens, cost: cost, savings: priced.savings,
-                    reportedCost: isReported
-                )
-                entries.append(.usage(key: key, record: record, billable: billable))
+            if let usage = openCodeUsage(json, id: id, session: sessionID, date: date,
+                                         model: sessionState.model, project: sessionState.project) {
+                entries.append(usage)
             }
 
             // OpenCode's loop goes on after tool calls, after a reply that
@@ -539,10 +532,17 @@ enum AgentLogParser {
                 if !parentID.isEmpty { remember(parentID, in: &sessionState.completedUserMessageIDs) }
             } else if !isAlreadyCompleted && matchesActivePrompt {
                 // A step that completed hands over to the next one at once,
-                // unless the loop stopped there.
+                // unless the loop stopped there. OpenCode 2 saves the next
+                // step only once the model starts to answer, which a long
+                // prompt can delay past the wait, and marks where its loop
+                // stopped with a row of its own instead.
                 if let completed, sessionState.turnOpen {
-                    sessionState.settledAt = completed
-                    entries.append(.turnSettled(completed))
+                    if json["version"] as? Int == 2 {
+                        entries.append(.turnActive(completed))
+                    } else {
+                        sessionState.settledAt = completed
+                        entries.append(.turnSettled(completed))
+                    }
                 } else {
                     entries.append(.turnActive(date))
                 }
@@ -551,6 +551,49 @@ enum AgentLogParser {
             state.project = sessionState.project
             state.model = sessionState.model
             state.turnOpen = sessionState.turnOpen
+            return entries
+
+        case "compaction":
+            // OpenCode 2 compacts in a row of its own, saved as it starts and
+            // again with what its request cost once it completes or fails.
+            // The turn it runs in goes on meanwhile.
+            let ownModel = ((json["model"] as? [String: Any])?["id"] as? String).flatMap { $0.isEmpty ? nil : native($0) }
+            var entries: [AgentLogEntry] = []
+            if let usage = openCodeUsage(json, id: id, session: sessionID, date: date,
+                                         model: ownModel ?? sessionState.model, project: sessionState.project) {
+                entries.append(usage)
+            }
+            if sessionState.turnOpen {
+                let moment = max(date, seconds(json["time_updated"]) ?? date)
+                sessionState.lastActivity = max(sessionState.lastActivity ?? moment, moment)
+                sessionState.settledAt = nil
+                entries.append(.turnActive(moment))
+            }
+            state.openCodeSessions[sessionID] = sessionState
+            state.project = sessionState.project
+            state.model = sessionState.model
+            state.turnOpen = sessionState.turnOpen
+            return entries
+
+        case "idle":
+            // OpenCode 2 marks where each turn ended and how, unless it quit
+            // in the middle of one.
+            sessionState.writingReplyID = ""
+            sessionState.settledAt = nil
+            var entries: [AgentLogEntry] = []
+            if sessionState.turnOpen {
+                var duration: TimeInterval?
+                if let turnStarted = sessionState.turnStarted, date >= turnStarted {
+                    duration = date.timeIntervalSince(turnStarted)
+                }
+                sessionState.turnOpen = false
+                sessionState.turnStarted = nil
+                sessionState.activeUserMessageID = ""
+                entries.append(.turnEnded(date, completed: json["outcome"] as? String == "succeeded",
+                                          duration: duration))
+            }
+            state.openCodeSessions[sessionID] = sessionState
+            state.turnOpen = false
             return entries
 
         default:
@@ -562,6 +605,45 @@ enum AgentLogParser {
     private static func remember(_ id: String, in ids: inout Set<String>) {
         if ids.count > 100 { ids.removeFirst() }
         ids.insert(id)
+    }
+
+    /// What an OpenCode reply or compaction used, priced from the list when
+    /// it knows `model`; nil while it holds no usage. A reply is saved
+    /// before its answer arrives, and a shell command run from the prompt,
+    /// the reply that hands work to a subtask and a request that failed or
+    /// was stopped never hold any usage.
+    private static func openCodeUsage(_ json: [String: Any], id: String, session: String, date: Date,
+                                      model: String, project: String) -> AgentLogEntry? {
+        let tokensDict = json["tokens"] as? [String: Any] ?? [:]
+        let reasoning = int(tokensDict["reasoning"])
+        let cacheDict = tokensDict["cache"] as? [String: Any] ?? [:]
+        let tokens = AgentTokens(input: int(tokensDict["input"]), cacheWrite: int(cacheDict["write"]),
+                                 cacheRead: int(cacheDict["read"]),
+                                 output: int(tokensDict["output"]) + reasoning, reasoning: reasoning)
+        let recordedCost = (json["cost"] as? NSNumber)?.doubleValue
+        guard tokens.total > 0 || (recordedCost ?? 0) > 0 else { return nil }
+        let billable = AgentBillable(tokens: tokens)
+        let priced = AgentPricing.cost(billable, model: model)
+        // A model the list does not know costs what OpenCode recorded.
+        // Local and free models record zero, which stays an estimate so
+        // a price the list learns later still applies.
+        let cost: Double?
+        let isReported: Bool
+        if let calculated = priced.cost {
+            cost = calculated
+            isReported = false
+        } else if let recordedCost {
+            cost = recordedCost
+            isReported = recordedCost > 0
+        } else {
+            cost = nil
+            isReported = false
+        }
+        let key = "opencode:\(session):\(id.isEmpty ? "\(date.timeIntervalSince1970)" : id)"
+        let record = AgentUsageRecord(provider: .opencode, date: date, model: model, project: project,
+                                      session: session, tokens: tokens, cost: cost, savings: priced.savings,
+                                      reportedCost: isReported)
+        return .usage(key: key, record: record, billable: billable)
     }
 
     /// Input counts include what came from the cache.

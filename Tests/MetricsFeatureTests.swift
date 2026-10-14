@@ -76,6 +76,68 @@ enum MetricsFeatureTests {
         expectEqual(MetricFormat.bytesPerSecCompact(1023.6 * 1024), "1.0M", "compact promotes rounded megabyte edge")
         expectEqual(MetricFormat.bytesPerSecCompact(9.96 * 1024 * 1024), "10M", "compact drops redundant decimal at 10M")
 
+        expectEqual(MetricFormat.bitsPerSec(0), "0 bps", "bit rate zero")
+        expectEqual(MetricFormat.bitsPerSec(100), "800 bps", "bit rate sub-kilobit")
+        expectEqual(MetricFormat.bitsPerSec(1_500), "12 Kbps", "bit rate 12 Kbps")
+        expectEqual(MetricFormat.bitsPerSec(1_200_000), "9.6 Mbps", "bit rate 9.6 Mbps")
+        expectEqual(MetricFormat.bitsPerSec(125_000_000), "1.0 Gbps", "bit rate gigabit")
+        expectEqual(MetricFormat.bitsPerSec(124.9), "999 bps", "bit rate keeps 999 bps")
+        expectEqual(MetricFormat.bitsPerSec(124.95), "1.0 Kbps", "bit rate promotes the rounded kilobit edge")
+        expectEqual(MetricFormat.bitsPerSec(124_950), "1.0 Mbps", "bit rate promotes the rounded megabit edge")
+        expectEqual(MetricFormat.bitsPerSec(.infinity), "0 bps", "bit rate non-finite")
+
+        expectEqual(MetricFormat.networkRate(1_500, inBits: true), "12 Kbps", "network rate in bits")
+        expectEqual(MetricFormat.networkRate(1_500 * 1024, inBits: false), "1.5 MB/s", "network rate in bytes")
+        expectEqual(MetricFormat.networkRateCompact(40_000, inBits: true), "320Kb", "compact network rate in bits")
+        expectEqual(MetricFormat.networkRateCompact(320 * 1024, inBits: false), "320K", "compact network rate in bytes")
+
+        // Someone who never picked a unit keeps the bytes they always saw,
+        // and a stray value does not switch them to bits either.
+        let savedSpeedUnit = UserDefaults.standard.object(forKey: DefaultsKey.networkSpeedUnit)
+        UserDefaults.standard.removeObject(forKey: DefaultsKey.networkSpeedUnit)
+        expectEqual(MetricFormat.networkRateCompact(320 * 1024), "320K", "network rate keeps bytes with no unit saved")
+        UserDefaults.standard.set("bit", forKey: DefaultsKey.networkSpeedUnit)
+        expectEqual(MetricFormat.networkRate(1_500 * 1024), "1.5 MB/s", "an unknown network unit reads as bytes")
+        UserDefaults.standard.set(NetworkSpeedUnit.bits.rawValue, forKey: DefaultsKey.networkSpeedUnit)
+        expectEqual(MetricFormat.networkRateCompact(40_000), "320Kb", "network rate follows a saved choice of bits")
+        if let savedSpeedUnit {
+            UserDefaults.standard.set(savedSpeedUnit, forKey: DefaultsKey.networkSpeedUnit)
+        } else {
+            UserDefaults.standard.removeObject(forKey: DefaultsKey.networkSpeedUnit)
+        }
+
+        // The menu bar sizes the rate block from five monospaced characters
+        // after the arrow, the same in both units, so no compact rate may
+        // print longer in either one.
+        var widestRate = ""
+        var sweptRate = 0.1
+        while sweptRate < 1e14 {
+            for inBits in [false, true] {
+                let text = MetricFormat.networkRateCompact(sweptRate, inBits: inBits)
+                if text.count > widestRate.count { widestRate = text }
+            }
+            sweptRate *= 1.01
+        }
+        suite.expect(widestRate.count == 5, "compact network rates fit the reserved menu bar block, widest \(widestRate)")
+
+        let bitsCeiling = MetricFormat.networkGraphCeiling(2_000, inBits: true)
+        suite.expect(bitsCeiling == 2_500, "bit graph ceiling rounds in bits and plots in bytes")
+        expectEqual(MetricFormat.networkRate(bitsCeiling, inBits: true), "20 Kbps", "bit graph ceiling label")
+        let bytesCeiling = MetricFormat.networkGraphCeiling(1_500, inBits: false)
+        suite.expect(bytesCeiling == 2_048, "byte graph ceiling keeps the 1024 steps")
+        expectEqual(MetricFormat.networkRate(bytesCeiling, inBits: false), "2.0 KB/s", "byte graph ceiling label")
+
+        expectEqual(MetricFormat.bitsPerSecCompact(0), "0b", "bits zero")
+        expectEqual(MetricFormat.bitsPerSecCompact(.nan), "0b", "bits non-finite")
+        expectEqual(MetricFormat.bitsPerSecCompact(100), "800b", "bits sub-kilobit")
+        expectEqual(MetricFormat.bitsPerSecCompact(124.9), "999b", "bits keeps 999b")
+        expectEqual(MetricFormat.bitsPerSecCompact(124.95), "1.0Kb", "bits promotes rounded kilobit edge")
+        expectEqual(MetricFormat.bitsPerSecCompact(40_000), "320Kb", "bits 320Kb")
+        expectEqual(MetricFormat.bitsPerSecCompact(1_200_000), "9.6Mb", "bits 9.6Mb")
+        expectEqual(MetricFormat.bitsPerSecCompact(1_245_000), "10Mb", "bits drops redundant decimal at 10Mb")
+        expectEqual(MetricFormat.bitsPerSecCompact(124_950), "1.0Mb", "bits promotes rounded megabit edge")
+        expectEqual(MetricFormat.bitsPerSecCompact(1_000_000_000), "8.0Gb", "bits gigabit")
+
         // MARK: Disk helpers
 
         suite.expect(DiskSupport.nvmeBytes(low: 2, high: nil) == 1_024_000,
@@ -727,6 +789,85 @@ enum MetricsFeatureTests {
         suite.expectClose(TemperatureSensorSelector.displayedCPUTemperature(
             readings: appleM4Sensors, platform: .appleM4Family
         ) ?? -1, 46.12, "a mapped M4 keeps reading its own cores, not the hotter hotspot")
+        suite.expectClose(TemperatureSensorSelector.displayedCPUTemperature(
+            readings: appleM4Sensors,
+            platform: TemperatureSensorSelector.platform(brandString: "Apple M4")
+        ) ?? -1, 46.12, "a base M4 identified by its brand keeps its mapped cores")
+
+        // MacBook Pro 14-inch, Mac16,8, Apple M4 Pro, macOS 15.7.1 (issue
+        // #2460). Te09, Te0H and Tp0V of the base M4 set do not exist here,
+        // and the keys it does map sit well below the hottest cores. Each
+        // Tpx/Tex key repeats the hottest of a few Tp/Te sensors next to it.
+        // One sample of --sensors under load:
+        let appleM4ProSensors: [(key: String, value: Double)] = [
+            ("Te05", 74.15), ("Te0S", 72.94), ("Te06", 79.64), ("Tex1", 79.64),
+            ("Tp01", 77.10), ("Tp05", 79.19), ("Tp09", 73.73), ("Tp0D", 74.44),
+            ("Tp0Y", 87.08), ("Tp0b", 77.96), ("Tp0e", 73.06),
+            ("Tp06", 91.91), ("Tp0c", 92.77), ("Tpx1", 92.77),
+            ("Tp0M", 96.59), ("Tp23", 96.59), ("TpxD", 96.59),
+            ("Tp0U", 97.84), ("Tpx5", 97.84), ("Tp29", 95.81),
+            ("Tp1o", 93.22), ("Tpx9", 93.22), ("Tp2G", 92.84),
+        ]
+        // Light idle (CPU 85 % idle), every P core parked: their sensors read
+        // 0, negative or a few degrees, and only the E-core family answers.
+        let appleM4ProIdleParked: [(key: String, value: Double)] = [
+            ("Te04", 49.00), ("Te05", 54.80), ("Te06", 58.05), ("Te0R", 48.93),
+            ("Te0S", 54.53), ("Te0T", 57.19),
+            ("Tex0", 53.00), ("Tex1", 58.05), ("Tex2", 52.93), ("Tex3", 57.19),
+            ("Tpx0", 0), ("Tpx1", 0), ("Tpx5", 0), ("Tpx9", 0), ("TpxD", 0),
+            ("Tp01", 2.20), ("Tp05", 1.50), ("Tp0Y", 0), ("Tp0U", 0),
+            ("Tp0W", -4.00), ("Tp00", -4.00), ("Tp2W", 5.20), ("Tp0v", 5.20),
+        ]
+        // Light idle (CPU 87 % idle) with part of the P cores awake: the base
+        // M4 set stops at Te05 while TpxD repeats a core at 76.48.
+        let appleM4ProIdleAwake: [(key: String, value: Double)] = [
+            ("Te05", 54.51), ("Te0S", 53.94), ("Tex1", 59.67), ("Tex3", 57.88),
+            ("Tpx5", 0), ("Tpx8", 56.84), ("Tpx9", 75.73), ("TpxB", 62.69),
+            ("TpxD", 76.48), ("Tp23", 76.48), ("Tp29", 75.84), ("Tp1o", 75.73),
+            ("Tp20", 68.09), ("Tp01", 2.20), ("Tp0Y", 0), ("Tp0W", -4.00),
+        ]
+        // Light idle (CPU 88 % idle) with the P-core summaries at 0 while ten
+        // parked P sensors, Tp0Y of the base M4 set among them, hold at 40.
+        let appleM4ProIdleHeld: [(key: String, value: Double)] = [
+            ("Te05", 60.81), ("Te0S", 60.93), ("Te06", 64.52),
+            ("Tex0", 59.45), ("Tex1", 64.52), ("Tex2", 59.34), ("Tex3", 63.88),
+            ("Tpx0", 0), ("Tpx5", 0), ("TpxD", 0),
+            ("Tp01", 40.00), ("Tp0Y", 40.00), ("Tp0W", 40.00), ("Tp23", 0),
+        ]
+        let m4ProPlatform = TemperatureSensorSelector.platform(brandString: "Apple M4 Pro")
+        suite.expect(TemperatureSensorSelector.platform(brandString: " Apple M4 Pro\n") == m4ProPlatform,
+               "M4 Pro identification ignores surrounding whitespace")
+        suite.expect(TemperatureSensorSelector.hasCPUCoreSet(platform: m4ProPlatform),
+               "an M4 Pro has its own CPU sensor set")
+        let m4ProCPUReadings = appleM4ProSensors.filter {
+            TemperatureSensorSelector.isCPUTemperatureKey($0.key, platform: m4ProPlatform)
+        }
+        suite.expect(m4ProCPUReadings.count == appleM4ProSensors.count
+                && !TemperatureSensorSelector.isCPUTemperatureKey("Tg0k", platform: m4ProPlatform)
+                && !TemperatureSensorSelector.isCPUTemperatureKey("TB0T", platform: m4ProPlatform),
+               "M4 Pro discovery keeps both CPU families and excludes GPU and battery")
+        suite.expectClose(TemperatureSensorSelector.displayedCPUTemperature(
+            readings: m4ProCPUReadings, platform: m4ProPlatform
+        ) ?? -1, 97.84, "an M4 Pro under load shows its hottest core, not the base M4 set")
+        suite.expectClose(TemperatureSensorSelector.displayedCPUTemperature(
+            readings: appleM4ProIdleParked, platform: m4ProPlatform
+        ) ?? -1, 58.05, "an idle M4 Pro with its P cores parked reads its hottest E core")
+        suite.expectClose(TemperatureSensorSelector.displayedCPUTemperature(
+            readings: appleM4ProIdleAwake, platform: m4ProPlatform
+        ) ?? -1, 76.48, "an idle M4 Pro reads a P core that is awake")
+        suite.expectClose(TemperatureSensorSelector.displayedCPUTemperature(
+            readings: appleM4ProIdleHeld, platform: m4ProPlatform
+        ) ?? -1, 64.52, "an idle M4 Pro ignores parked P sensors holding a fixed value")
+        // A key outside the set that runs hot at idle, as Tp0W does on the
+        // base M4, must not become the reading while the set answers.
+        suite.expectClose(TemperatureSensorSelector.displayedCPUTemperature(
+            readings: appleM4ProIdleParked + [("Tp0W", 68.0), ("Tp3X", 69.0)],
+            platform: m4ProPlatform
+        ) ?? -1, 58.05, "an M4 Pro keeps a hotter auxiliary sensor out of the idle reading")
+        suite.expectClose(TemperatureSensorSelector.displayedCPUTemperature(
+            readings: [("Tex1", 0), ("Tpx5", 7.0), ("TpxD", 130.0), ("Te05", 54.80)],
+            platform: m4ProPlatform
+        ) ?? -1, 54.80, "an M4 Pro whose set has no plausible reading still shows its CPU family")
         let genericCPU = TemperatureSensorSelector.displayedCPUTemperature(
             readings: [("Tp00", 44.5), ("Tp01", 51.6)],
             platform: .generic
@@ -773,6 +914,63 @@ enum MetricsFeatureTests {
                "a missing temperature does not alert")
         suite.expect(!quietGate.shouldAlert(reading: 99, threshold: 90, readAt: nil),
                "a temperature with no reading time does not alert")
+
+        // MARK: CPU cores
+
+        let idleTicks = CPUCoreTicks(user: 0, system: 0, idle: 0, nice: 0)
+        suite.expect(CPUCoreTicks(user: 20, system: 20, idle: 50, nice: 10).usage(since: idleTicks) == 0.5,
+               "per-core usage counts user, system and nice as busy")
+        suite.expect(idleTicks.usage(since: idleTicks) == nil,
+               "unchanged counters do not invent a zero reading")
+        let earlierTicks = CPUCoreTicks(user: 100, system: 100, idle: 100, nice: 100)
+        suite.expect(CPUCoreTicks(user: 110, system: 110, idle: 120, nice: 100).usage(since: earlierTicks) == 0.5,
+               "per-core readings use the interval delta, not lifetime totals")
+        suite.expect(idleTicks.usage(since: earlierTicks) == nil,
+               "reset counters need a fresh baseline")
+        let beforeWrap = CPUCoreTicks(user: UInt32.max - 4, system: 0, idle: 0, nice: 0)
+        suite.expect(CPUCoreTicks(user: 5, system: 0, idle: 10, nice: 0).usage(since: beforeWrap) == 0.5,
+               "a 32-bit tick rollover keeps the interval delta")
+
+        let twoLevels = [(name: "Performance", count: 4), (name: "Efficiency", count: 6)]
+        let registryCores = (0..<10).map { (id: $0, type: $0 < 6 ? "E" : "P") }
+        suite.expect(CPUCoreTopology.groups(levels: twoLevels, cores: registryCores.reversed(), slots: Array(0..<10))
+                == [CPUCoreGroup(name: "Performance", indices: Array(6..<10)),
+                    CPUCoreGroup(name: "Efficiency", indices: Array(0..<6))],
+               "core classes follow the registry's logical IDs, not perflevel order")
+        suite.expect(CPUCoreTopology.groups(levels: twoLevels, cores: registryCores,
+                                            slots: [6, 0, 7, 1, 8, 2, 9, 3, 4, 5]).first?.indices == [0, 2, 4, 6],
+               "group indices address the sampler's processor order")
+        for broken in [Array(registryCores.dropLast()), registryCores + [registryCores[0]],
+                       registryCores.map { (id: $0.id, type: "?") }] {
+            suite.expect(CPUCoreTopology.groups(levels: twoLevels, cores: broken, slots: Array(0..<10)).map(\.name) == ["CPU"],
+                   "missing, duplicated or unknown registry cores fall back to one CPU group")
+        }
+        for width in [160.0, 280, 500] {
+            for counts in [[4, 6], [2, 4, 6], [32, 16], [1]] {
+                var start = 0
+                let groups = counts.enumerated().map { index, count in
+                    defer { start += count }
+                    return CPUCoreGroup(name: ["Super", "Performance", "Efficiency"][index % 3],
+                                        indices: Array(start..<(start + count)))
+                }
+                let rows = CPUCoreLayout.rows(groups: groups, width: width)
+                suite.expect(rows.flatMap { $0 }.flatMap(\.group.indices) == Array(0..<start),
+                       "the core layout keeps every core exactly once (\(counts) at \(width))")
+                suite.expect(rows.allSatisfy { row in
+                    row.reduce(0, { $0 + $1.width }) + Double(max(0, row.count - 1)) * 12 <= width + 0.01
+                }, "core rows stay inside their width (\(counts) at \(width))")
+                suite.expect(rows.joined().allSatisfy { segment in
+                    let count = Double(segment.group.indices.count)
+                    return count * segment.barWidth + (count - 1) * 4 <= segment.width + 0.01
+                }, "core bars stay inside their group (\(counts) at \(width))")
+            }
+        }
+        let wrapped = CPUCoreLayout.rows(groups: [CPUCoreGroup(name: "Performance", indices: Array(0..<10)),
+                                                  CPUCoreGroup(name: "Efficiency", indices: Array(10..<14))], width: 272)
+        let performanceBar = wrapped.joined().first { $0.group.name == "Performance" }?.barWidth ?? 0
+        let efficiencyBar = wrapped.joined().first { $0.group.name == "Efficiency" }?.barWidth ?? .infinity
+        suite.expect(wrapped.count == 2 && performanceBar > efficiencyBar,
+               "efficiency cores wrapped onto a row of their own never get wider bars than performance cores")
 
         // MARK: Uptime formatting
 

@@ -172,6 +172,7 @@ enum NotchDestinationContract {
             (.cpu, .monitorCPU), (.gpu, .monitorGPU), (.memory, .monitorMemory),
             (.network, .monitorNetwork), (.disk, .monitorDisk),
             (.battery, .monitorPower), (.power, .monitorPower), (.fan, .fanControl),
+            (.connectedDevices, .connectedDevices),
         ]
         for (metric, feature) in families {
             let service = Service()
@@ -388,6 +389,7 @@ enum NotchDestinationContract {
                 if $0 == DefaultsKey.notchOpensActivity { return false }
                 if $0 == DefaultsKey.notchHideUntilHover { return true }
                 if $0 == DefaultsKey.notchHoverDelay { return 0.65 }
+                if $0 == DefaultsKey.notchCloseDelay { return 1.5 }
                 return nil
             }
             let data = try? JSONSerialization.data(withJSONObject: payload)
@@ -397,8 +399,9 @@ enum NotchDestinationContract {
                    && restored?[DefaultsKey.notchHomeModule] as? String == NotchModule.music.rawValue
                    && restored?[DefaultsKey.notchOpensActivity] as? Bool == false
                    && restored?[DefaultsKey.notchHoverDelay] as? Double == 0.65
+                   && restored?[DefaultsKey.notchCloseDelay] as? Double == 1.5
                    && restored?[DefaultsKey.notchHideUntilHover] as? Bool == true,
-                   "the opening behavior, selected page, activity choice and activation time survive backup and restore")
+                   "the opening behavior, selected page, activity choice and hover timings survive backup and restore")
 
             let service = Service()
             service.open(.files)

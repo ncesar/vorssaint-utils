@@ -11,11 +11,18 @@ import UserNotifications
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
     private var statusController: StatusItemController!
     private let popover = NSPopover()
-    private var popoverClosedAt = Date.distantPast
     private var popoverDismissMonitor: Any?
     private var popoverLocalDismissMonitor: Any?
     private var popoverKeyboardMonitor: Any?
     private var popoverIsClosing = false
+    /// Counts close fades, so a fade cut short by a reopen never closes the
+    /// panel shown after it.
+    private var popoverCloseFadeSerial = 0
+    private var popoverIsFadingOut = false
+    /// The window being faded, kept for the end of the fade even if the
+    /// popover has let go of it by then.
+    private weak var fadingPopoverWindow: NSWindow?
+    private var popoverIsReopening = false
     private var popoverCloseIsAppRequested = false
     /// The last visible geometry and event destination survive AppKit's teardown.
     private var popoverLastFrame: CGRect?
@@ -69,6 +76,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         // quitting to relaunch under the new name, so skip the rest of startup.
         if BundleMigration.run() { return }
 
+        DispatchQueue.global(qos: .utility).async {
+            RecorderGIFWorkspace.sweep()
+        }
+
         // Shape a clean install before any feature can create a listener,
         // timer or shortcut. The onboarding can replace this set after the
         // person chooses what they actually want.
@@ -76,7 +87,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 
         // Redo a launch at login registration the system lost. The stored
         // choice is the last thing the user expressed in the app; startup
-        // never turns the item off.
+        // never turns the item off. It runs off the main thread, since
+        // Service Management can stall while answering (issue #2539).
         LaunchAtLogin.repairAtStartup()
 
         // Switch back on any display a previous run left off. A run that ends
@@ -360,7 +372,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if self.iconIsOnScreen(), !self.popover.isShown {
-                self.popoverClosedAt = .distantPast
                 self.togglePopover()
             }
             if !self.popover.isShown {
@@ -445,14 +456,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         AppAppearanceController.shared.follow(panel: popover)
     }
 
+    /// Shown and not on its way out. A click on a panel that is fading out
+    /// opens it again rather than being lost to the fade.
+    private var popoverIsOpen: Bool {
+        popover.isShown && !popoverIsClosing
+    }
+
     private func togglePopover(anchor button: NSStatusBarButton? = nil) {
         // A detached panel closes only from its own button; the icon brings it back.
-        if popover.isDetached {
+        if popoverIsOpen, popover.isDetached {
             popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        if popover.isShown {
+        if popoverIsOpen {
             closePopover(reason: .statusItem)
             return
         }
@@ -463,7 +480,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         if NotchSupport.routesAppPanel(), NotchService.shared.acceptsSystemFeedback {
             NotchService.shared.openAppPanel(toggle: true); return
         }
-        if !popover.isShown {
+        if !popoverIsOpen {
             MenuPanelFocus.shared.showNormalPanel()
         }
         togglePopover()
@@ -480,11 +497,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             NotchService.shared.showMetric(detailKind, toggle: true); return
         }
         // Re-showing would pull a detached panel back under the icon.
-        if popover.isDetached {
+        if popoverIsOpen, popover.isDetached {
             MenuPanelFocus.shared.focus(detailKind)
             return
         }
-        if popover.isShown {
+        if popoverIsOpen {
             if MenuPanelFocus.shared.activeMetric == detailKind {
                 metricAnchorSwitchSerial &+= 1
                 MenuPanelFocus.shared.clearMetricFocus()
@@ -516,7 +533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     private func reanchorMetricPopover(to detailKind: MetricDetailKind, anchoredTo button: NSStatusBarButton) {
         guard popover.isShown else {
             MenuPanelFocus.shared.focus(detailKind)
-            showPopover(anchor: button, allowRecentClose: true, animate: false, activate: false)
+            showPopover(anchor: button, animate: false, activate: false)
             return
         }
         let serial = metricAnchorSwitchSerial
@@ -971,9 +988,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
                 }
                 return
             }
-            self.popoverClosedAt = .distantPast
             MenuPanelFocus.shared.focus(detailKind)
-            self.showPopover(anchor: button, allowRecentClose: true, animate: false, activate: false)
+            self.showPopover(anchor: button, animate: false, activate: false)
             DispatchQueue.main.async {
                 self.popoverIsSwitchingAnchor = false
                 MenuPanelFocus.shared.setSwitchingMetricAnchor(false)
@@ -982,14 +998,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     }
 
     private func showPopover(anchor button: NSStatusBarButton? = nil,
-                             allowRecentClose: Bool = false,
                              animate: Bool = true,
                              activate: Bool = true,
                              restoring savedAnchor: PanelAnchor? = nil) {
+        // An interrupted fade continues the same presentation. Keep the
+        // requested metric and activation source through its intermediate close.
+        let reopening = popoverIsFadingOut && popover.isShown
+        let interruptedCloseReason = popoverCloseReason
+        popoverIsReopening = reopening
+        finishPopoverFadeOut()
+        popoverIsReopening = false
+        defer {
+            if reopening, !popover.isShown {
+                statusController.setMicBadgeHeld(false)
+                releasePanelResources()
+                returnActivation(to: endPanelActivationTracking(), after: interruptedCloseReason)
+            }
+        }
         guard !popover.isShown, !popoverIsClosing else { return }
-        // The click that just transient-dismissed the popover also lands here;
-        // reopening would make the panel look impossible to close.
-        guard allowRecentClose || Date().timeIntervalSince(popoverClosedAt) > 0.35 else { return }
         guard let button = button ?? statusController.button else { return }
 
         // The panel measures itself against this while the popover lays out, so
@@ -1016,7 +1042,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             statusController.setMicBadgeHeld(false)
         }
         if activate {
-            beginPanelActivationTracking()
+            if !reopening || panelActivationObservers.isEmpty {
+                beginPanelActivationTracking()
+            }
             NSApp.activate(ignoringOtherApps: true)
         }
         // Only arm the monitors and the anchor if the popover actually presented
@@ -1025,7 +1053,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         guard popover.isShown else {
             statusController.setMicBadgeHeld(false)
             endPopoverDriftCorrection()
-            endPanelActivationTracking()
+            if !reopening { endPanelActivationTracking() }
             return
         }
         if let window = popover.contentViewController?.view.window {
@@ -1197,13 +1225,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         guard !popoverIsClosing else { return }
 
         popoverIsClosing = true
-        if animated {
-            popover.performClose(nil)
+        if animated, let window = popover.contentViewController?.view.window {
+            fadeOutPopover(window)
         } else {
-            popover.animates = false
-            popover.close()
-            popover.animates = true
+            closePopoverWithoutAnimation()
         }
+    }
+
+    /// AppKit's animated close keeps the popover on screen for about half a
+    /// second after it has faded (measured on macOS 15 and 27), and the panel
+    /// cannot be shown again until then, so a click on the icon in that time
+    /// did nothing. The panel fades itself out and then closes at once.
+    private func fadeOutPopover(_ window: NSWindow) {
+        popoverCloseFadeSerial &+= 1
+        let serial = popoverCloseFadeSerial
+        popoverIsFadingOut = true
+        fadingPopoverWindow = window
+        window.ignoresMouseEvents = true
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.1
+            window.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            guard let self, self.popoverCloseFadeSerial == serial else { return }
+            self.finishPopoverFadeOut()
+        }
+    }
+
+    private func finishPopoverFadeOut() {
+        guard popoverIsFadingOut else { return }
+        popoverIsFadingOut = false
+        popoverCloseFadeSerial &+= 1
+        let window = fadingPopoverWindow ?? popover.contentViewController?.view.window
+        fadingPopoverWindow = nil
+        closePopoverWithoutAnimation()
+        // The popover may present from the same window next time. A direct
+        // set also stops a fade AppKit is still stepping, as when a click
+        // reopens the panel mid-fade; a zero-length animation does not.
+        if let window {
+            window.alphaValue = 1
+            window.ignoresMouseEvents = false
+        }
+    }
+
+    private func closePopoverWithoutAnimation() {
+        popover.animates = false
+        popover.close()
+        popover.animates = true
     }
 
     private func runPopoverCloseCompletions() {
@@ -1257,9 +1324,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         if !popoverCloseIsAppRequested, PanelInteractionState.shared.isDetached {
             popoverCloseReason = .closeButton
         }
-        if !popoverIsSwitchingAnchor {
-            popoverClosedAt = Date()
-        }
     }
 
     func popoverDidClose(_ notification: Notification) {
@@ -1277,7 +1341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         if !popoverIsSwitchingAnchor && !popover.isShown {
             statusController.setMicBadgeHeld(false)
         }
-        if !popoverIsSwitchingAnchor {
+        if !popoverIsSwitchingAnchor && !popoverIsReopening {
             releasePanelResources()
         }
         removePopoverDismissMonitor()
@@ -1285,7 +1349,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         PanelInteractionState.shared.viewKeepsPopoverOpen = false
         PanelInteractionState.shared.isPresentingPopoverModal = false
         PanelInteractionState.shared.isDetached = false
-        popoverClosedAt = popoverIsSwitchingAnchor ? .distantPast : Date()
         popoverIsClosing = false
         popoverCloseIsAppRequested = false
         let closeReason = popoverCloseReason
@@ -1293,7 +1356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         runPopoverCloseCompletions()
         if let recoveryAnchor {
             reopenPanelAfterForeignClose(anchor: recoveryAnchor)
-        } else if !popoverIsSwitchingAnchor {
+        } else if !popoverIsSwitchingAnchor && !popoverIsReopening {
             returnActivation(to: endPanelActivationTracking(), after: closeReason)
         }
     }
@@ -1422,8 +1485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     private func reopenPanelAfterForeignClose(anchor: PanelAnchor) {
         popoverForeignReopenAt = Date()
         if let button = anchor.button {
-            showPopover(anchor: button, allowRecentClose: true, animate: false, activate: false,
-                        restoring: anchor)
+            showPopover(anchor: button, animate: false, activate: false, restoring: anchor)
         }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
