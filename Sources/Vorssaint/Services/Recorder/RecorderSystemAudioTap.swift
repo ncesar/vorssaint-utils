@@ -45,7 +45,8 @@ enum RecorderAudioProbe {
 }
 
 /// The sound of the Mac for a recording, read from the audio system as one
-/// mix of every process but this one.
+/// mix of every process but this one. A recording of one window hears only
+/// the app that owns it, so the sound follows the picture.
 ///
 /// ScreenCaptureKit hands over the same mix, but an app the volume mixer
 /// adjusts reaches it twice: its own muted stream and this app's re-render
@@ -66,7 +67,7 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
     /// the recording's clock. Set before `start`.
     var onSample: ((CMSampleBuffer) -> Void)?
 
-    /// Called on this tap's own queue when an output device change left it
+    /// Called on this tap's own queue when a device or process change left it
     /// without a reader, so the recording can go back to the stream's sound
     /// instead of falling silent. Set before `start`.
     var onReaderLost: (() -> Void)?
@@ -76,9 +77,13 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
 
     private let queue: DispatchQueue
     private let heard = RecorderAudioFlag()
-    private let tapID: AudioObjectID
-    private let tapUID: String
-    private let tapChannels: Int
+    /// The one app to hear, or nothing for the whole Mac.
+    private let pid: pid_t?
+    private var tapID = AudioObjectID(0)
+    private var tapUID = ""
+    private var tapChannels = 2
+    /// The processes an app's tap was built from, to notice when they change.
+    private var tapped: [AudioObjectID] = []
     private var clock: CMClock?
     private var aggregateID = AudioObjectID(0)
     private var ioProc: AudioDeviceIOProcID?
@@ -86,6 +91,7 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
     private var sampleRate: Double = 0
     private var deviceListener: AudioObjectPropertyListenerBlock?
     private var rateListener: AudioObjectPropertyListenerBlock?
+    private var processListener: AudioObjectPropertyListenerBlock?
     private var stopped = false
 
     /// Destroying a device or a tap can park inside a broken audio path, so
@@ -94,28 +100,46 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
     private static let teardownQueue = DispatchQueue(label: "com.vorssaint.recorder.systemaudio.teardown",
                                                      qos: .utility)
 
-    /// The tap, or nothing when the audio system refuses one.
-    static func make() async -> RecorderSystemAudioTap? {
+    /// The tap, or nothing when the audio system refuses one. A `pid` narrows
+    /// it to that app's sound.
+    static func make(hearing pid: pid_t?) async -> RecorderSystemAudioTap? {
         guard #available(macOS 14.4, *) else { return nil }
         let queue = DispatchQueue(label: "com.vorssaint.recorder.systemaudio",
                                   qos: .userInitiated)
         return await withCheckedContinuation { continuation in
             queue.async {
-                continuation.resume(returning: RecorderSystemAudioTap(queue: queue))
+                continuation.resume(returning: RecorderSystemAudioTap(queue: queue, pid: pid))
             }
         }
     }
 
     @available(macOS 14.4, *)
-    private init?(queue: DispatchQueue) {
+    private init?(queue: DispatchQueue, pid: pid_t?) {
         self.queue = queue
-        guard let ownProcess = Self.ownProcessObject() else { return nil }
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcess])
+        self.pid = pid
+        guard buildTap() else { return nil }
+    }
+
+    /// One app's processes for a recording of its window, or every process
+    /// but this one.
+    @available(macOS 14.4, *)
+    private func buildTap() -> Bool {
+        let description: CATapDescription
+        if let pid {
+            let objects = Self.processObjects(for: pid)
+            guard !objects.isEmpty else { return false }
+            tapped = objects
+            description = CATapDescription(stereoMixdownOfProcesses: objects)
+        } else {
+            guard let ownProcess = Self.processObject(for: ProcessInfo.processInfo.processIdentifier)
+            else { return false }
+            description = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcess])
+        }
         description.name = "Vorssaint Recorder"
         description.isPrivate = true
         var tapID = AudioObjectID(0)
         guard AudioHardwareCreateProcessTap(description, &tapID) == noErr, tapID != 0 else {
-            return nil
+            return false
         }
         self.tapID = tapID
         tapUID = description.uuid.uuidString
@@ -123,6 +147,7 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
         tapChannels = Self.read(tapID, kAudioTapPropertyFormat, &format) && format.mChannelsPerFrame > 0
             ? Int(format.mChannelsPerFrame)
             : 2
+        return true
     }
 
     deinit {
@@ -147,6 +172,7 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
                 if !stopped {
                     buildPipeline()
                     watchDefaultOutputDevice()
+                    watchProcessList()
                 }
                 continuation.resume(returning: aggregateID != 0)
             }
@@ -162,6 +188,12 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
                     AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
                                                            &address, queue, deviceListener)
                     self.deviceListener = nil
+                }
+                if let processListener {
+                    var address = Self.address(kAudioHardwarePropertyProcessObjectList)
+                    AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
+                                                           &address, queue, processListener)
+                    self.processListener = nil
                 }
                 teardownPipeline()
                 Self.destroy(aggregateID: 0, ioProc: nil, tapID: tapID)
@@ -273,6 +305,35 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
         // Nothing came back, and with no aggregate left this tap can no longer
         // see a later change, so the rest of the recording needs the stream.
         if aggregateID == 0 { onReaderLost?() }
+    }
+
+    /// A browser makes its sound in a helper process that comes and goes with
+    /// its tabs, and a tap hears only the processes it was built from, so an
+    /// app's tap is made again around its processes as they are now. Only a
+    /// real change rebuilds, because any app launching stirs the same list.
+    private func rebuildTapIfProcessesChanged() {
+        guard !stopped, aggregateID != 0, let pid, #available(macOS 14.4, *) else { return }
+        let current = Self.processObjects(for: pid)
+        guard !current.isEmpty, Set(current) != Set(tapped) else { return }
+        teardownPipeline()
+        Self.destroy(aggregateID: 0, ioProc: nil, tapID: tapID)
+        tapID = 0
+        if buildTap() { buildPipeline() }
+        if aggregateID == 0 { onReaderLost?() }
+    }
+
+    private func watchProcessList() {
+        guard pid != nil, processListener == nil else { return }
+        var address = Self.address(kAudioHardwarePropertyProcessObjectList)
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.rebuildTapIfProcessesChanged()
+        }
+        if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
+                                               &address, queue, listener) == noErr {
+            processListener = listener
+        }
+        // The app may have opened a helper since the tap was made.
+        rebuildTapIfProcessesChanged()
     }
 
     private func watchDefaultOutputDevice() {
@@ -401,8 +462,27 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
         }
     }
 
-    private static func ownProcessObject() -> AudioObjectID? {
-        var pid = ProcessInfo.processInfo.processIdentifier
+    /// Every audio process the app answers for. A browser makes its sound in
+    /// a helper process, so a tap on the app's own pid alone would never hear
+    /// it; the mixer gathers its rows the same way.
+    @available(macOS 14.4, *)
+    private static func processObjects(for pid: pid_t) -> [AudioObjectID] {
+        var objects: [AudioObjectID] = []
+        for object in AppVolumeMixer.audioProcessObjects() {
+            var owner: pid_t = -1
+            guard read(object, kAudioProcessPropertyPID, &owner), owner > 0,
+                  owner == pid || ResponsibleProcess.regularAppOwner(of: owner)?.processIdentifier == pid
+            else { continue }
+            objects.append(object)
+        }
+        // An app that holds no audio connection yet still has a process
+        // object of its own, which starts sounding when it does.
+        if objects.isEmpty, let direct = processObject(for: pid) { objects.append(direct) }
+        return objects
+    }
+
+    private static func processObject(for pid: pid_t) -> AudioObjectID? {
+        var pid = pid
         var object = AudioObjectID(0)
         var address = address(kAudioHardwarePropertyTranslatePIDToProcessObject)
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
