@@ -246,6 +246,9 @@ enum RecorderFeatureTests {
                "even a tiny area gets a usable stream")
         suite.expect(highRate <= 60_000_000,
                "no preset asks for more than the media engine sustains")
+        let qualities = RecorderSupport.Quality.allCases.map(\.encoderQuality)
+        suite.expect(qualities == qualities.sorted() && qualities.allSatisfy { $0 > 0 && $0 <= 1 },
+               "export presets rise in encoder quality and stay within its 0 to 1 range")
 
         let now = Date(timeIntervalSince1970: 1_000_000)
         let beingEdited = UUID()
