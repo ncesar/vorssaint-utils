@@ -4,7 +4,8 @@
 import AppKit
 import QuartzCore
 
-/// The small pill that shows recording time and keeps pause and stop reachable.
+/// The small pill that shows recording time and keeps pause, microphone mute
+/// and stop reachable.
 ///
 /// It floats instead of living in the menu bar on purpose: a menu bar that is
 /// full drops the items that do not fit, and the one control that ends a
@@ -17,6 +18,7 @@ final class RecorderIndicator {
     private var pill: PillView?
     private var regionGuide: NSPanel?
     private let onPause: () -> Void
+    private let onToggleMicrophone: () -> Void
     private let onStop: () -> Void
 
     /// The window the capture has to leave out. Everything else this app puts
@@ -29,8 +31,11 @@ final class RecorderIndicator {
         }
     }
 
-    init(onPause: @escaping () -> Void, onStop: @escaping () -> Void) {
+    init(onPause: @escaping () -> Void,
+         onToggleMicrophone: @escaping () -> Void,
+         onStop: @escaping () -> Void) {
         self.onPause = onPause
+        self.onToggleMicrophone = onToggleMicrophone
         self.onStop = onStop
     }
 
@@ -74,20 +79,27 @@ final class RecorderIndicator {
               tooltip: String,
               pauseTooltip: String,
               resumeTooltip: String,
+              showsMicrophone: Bool,
+              muteTooltip: String,
+              unmuteTooltip: String,
               stopTooltip: String) {
         guard panel == nil else { return }
         let host = screen ?? NSScreen.main ?? NSScreen.screens.first
         guard let host else { return }
 
-        let pill = PillView(frame: CGRect(origin: .zero, size: PillView.size))
+        let pill = PillView(showsMicrophone: showsMicrophone)
+        let size = pill.frame.size
         pill.toolTip = tooltip
         pill.pauseTooltip = pauseTooltip
         pill.resumeTooltip = resumeTooltip
+        pill.muteTooltip = muteTooltip
+        pill.unmuteTooltip = unmuteTooltip
         pill.stopTooltip = stopTooltip
         pill.onPause = { [weak self] in self?.onPause() }
+        pill.onToggleMicrophone = { [weak self] in self?.onToggleMicrophone() }
         pill.onStop = { [weak self] in self?.onStop() }
 
-        let panel = OverlayPanel(contentRect: CGRect(origin: .zero, size: PillView.size),
+        let panel = OverlayPanel(contentRect: CGRect(origin: .zero, size: size),
                                  styleMask: [.borderless, .nonactivatingPanel],
                                  backing: .buffered,
                                  defer: false)
@@ -101,8 +113,8 @@ final class RecorderIndicator {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary,
                                     .stationary, .ignoresCycle]
         let frame = host.visibleFrame
-        panel.setFrameOrigin(CGPoint(x: (frame.midX - PillView.size.width / 2).rounded(),
-                                     y: (frame.maxY - PillView.size.height - 10).rounded()))
+        panel.setFrameOrigin(CGPoint(x: (frame.midX - size.width / 2).rounded(),
+                                     y: (frame.maxY - size.height - 10).rounded()))
         panel.alphaValue = 0
         panel.orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { context in
@@ -120,6 +132,10 @@ final class RecorderIndicator {
 
     func update(paused: Bool) {
         pill?.setPaused(paused)
+    }
+
+    func update(microphoneMuted: Bool) {
+        pill?.setMicrophoneMuted(microphoneMuted)
     }
 
     func hide() {
@@ -165,26 +181,32 @@ final class RecorderIndicator {
     // MARK: - The pill
 
     private final class PillView: NSView {
-        static let size = CGSize(width: 150, height: 32)
+        static let height: CGFloat = 32
 
         var onPause: (() -> Void)?
+        var onToggleMicrophone: (() -> Void)?
         var onStop: (() -> Void)?
         var pauseTooltip = ""
         var resumeTooltip = ""
+        var muteTooltip = ""
+        var unmuteTooltip = ""
         var stopTooltip = ""
 
         private let dot = CALayer()
         private let label = NSTextField(labelWithString: "0:00")
         private let pauseButton = IndicatorButton()
+        private let microphoneButton = IndicatorButton()
         private let stopButton = IndicatorButton()
 
-        override init(frame frameRect: NSRect) {
-            super.init(frame: frameRect)
+        init(showsMicrophone: Bool) {
+            super.init(frame: CGRect(x: 0, y: 0,
+                                     width: showsMicrophone ? 184 : 150,
+                                     height: Self.height))
             wantsLayer = true
 
             dot.backgroundColor = NSColor.systemRed.cgColor
             dot.cornerRadius = 4
-            dot.frame = CGRect(x: 12, y: (Self.size.height - 8) / 2, width: 8, height: 8)
+            dot.frame = CGRect(x: 12, y: (Self.height - 8) / 2, width: 8, height: 8)
             addPulse()
             layer?.addSublayer(dot)
 
@@ -194,13 +216,21 @@ final class RecorderIndicator {
             label.frame = CGRect(x: 25, y: 6, width: 50, height: 18)
             addSubview(label)
 
+            var x: CGFloat = 82
             configure(pauseButton,
                       symbol: "pause.fill",
-                      frame: CGRect(x: 82, y: 3, width: 30, height: 26),
+                      frame: CGRect(x: x, y: 3, width: 30, height: 26),
                       action: #selector(pausePressed))
+            if showsMicrophone {
+                x += 34
+                configure(microphoneButton,
+                          symbol: "mic.fill",
+                          frame: CGRect(x: x, y: 3, width: 30, height: 26),
+                          action: #selector(microphonePressed))
+            }
             configure(stopButton,
                       symbol: "stop.fill",
-                      frame: CGRect(x: 116, y: 3, width: 30, height: 26),
+                      frame: CGRect(x: x + 34, y: 3, width: 30, height: 26),
                       action: #selector(stopPressed))
             stopButton.contentTintColor = .systemRed
         }
@@ -225,6 +255,14 @@ final class RecorderIndicator {
                 dot.opacity = 1
                 addPulse()
             }
+        }
+
+        func setMicrophoneMuted(_ muted: Bool) {
+            microphoneButton.image = symbolImage(muted ? "mic.slash.fill" : "mic.fill")
+            // A muted voice is easy to forget mid-take, so it stays loud on screen.
+            microphoneButton.contentTintColor = muted ? .systemOrange : .white
+            microphoneButton.toolTip = muted ? unmuteTooltip : muteTooltip
+            microphoneButton.setAccessibilityLabel(muted ? unmuteTooltip : muteTooltip)
         }
 
         override func draw(_ dirtyRect: NSRect) {
@@ -282,12 +320,15 @@ final class RecorderIndicator {
         }
 
         @objc private func pausePressed() { onPause?() }
+        @objc private func microphonePressed() { onToggleMicrophone?() }
         @objc private func stopPressed() { onStop?() }
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             pauseButton.toolTip = pauseTooltip
             pauseButton.setAccessibilityLabel(pauseTooltip)
+            microphoneButton.toolTip = muteTooltip
+            microphoneButton.setAccessibilityLabel(muteTooltip)
             stopButton.toolTip = stopTooltip
             stopButton.setAccessibilityLabel(stopTooltip)
         }

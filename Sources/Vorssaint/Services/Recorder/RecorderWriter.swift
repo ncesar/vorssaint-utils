@@ -34,6 +34,11 @@ final class RecorderWriter {
     private var started = false
     private var failed = false
 
+    /// Set from the writer queue like every append, so a sample is muted or
+    /// not by the order it arrived in. Muted samples are written as silence
+    /// rather than dropped, which keeps the voice track as long as the video.
+    var isMicrophoneMuted = false
+
     /// Frames actually written, so a recording that produced nothing can be
     /// reported as a failure instead of leaving an unplayable file behind.
     private(set) var videoFrameCount = 0
@@ -201,8 +206,8 @@ final class RecorderWriter {
         case .microphone:
             guard let microphoneInput else { return .dropped }
             guard microphoneInput.isReadyForMoreMediaData else { return .notReady }
-            guard
-                  let interleaved = Self.interleavedAudioSample(sampleBuffer, converter: &microphoneConverter),
+            guard let source = isMicrophoneMuted ? Self.silentAudioSample(like: sampleBuffer) : sampleBuffer,
+                  let interleaved = Self.interleavedAudioSample(source, converter: &microphoneConverter),
                   let retimed = RecorderSampleTiming.retimed(interleaved, to: shifted)
             else { return .dropped }
             guard microphoneInput.append(retimed) else {
@@ -256,7 +261,26 @@ final class RecorderWriter {
         do { try converter.convert(to: output, from: input) }
         catch { return nil }
         guard output.frameLength == count else { return nil }
+        return audioSample(output, timedLike: sample)
+    }
 
+    /// Zeroed PCM in the sample's own format and timing, so the converter and
+    /// the encoder see nothing different from a quiet room.
+    private static func silentAudioSample(like sample: CMSampleBuffer) -> CMSampleBuffer? {
+        guard let description = CMSampleBufferGetFormatDescription(sample),
+              let count = AVAudioFrameCount(exactly: CMSampleBufferGetNumSamples(sample)), count > 0,
+              let silence = AVAudioPCMBuffer(pcmFormat: AVAudioFormat(cmAudioFormatDescription: description),
+                                             frameCapacity: count)
+        else { return nil }
+        silence.frameLength = count
+        for buffer in UnsafeMutableAudioBufferListPointer(silence.mutableAudioBufferList) {
+            if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+        }
+        return audioSample(silence, timedLike: sample)
+    }
+
+    private static func audioSample(_ output: AVAudioPCMBuffer,
+                                    timedLike sample: CMSampleBuffer) -> CMSampleBuffer? {
         var timingCount = 0
         guard CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: 0,
             arrayToFill: nil, entriesNeededOut: &timingCount) == noErr, timingCount > 0 else { return nil }

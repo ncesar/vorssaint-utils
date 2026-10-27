@@ -171,6 +171,12 @@ private final class RecorderSession: NSObject, RecorderCaptureEngineDelegate {
 
     var isPaused: Bool { pauseClock.isPaused }
 
+    var capturesMicrophone: Bool { microphone != nil }
+
+    func setMicrophoneMuted(_ muted: Bool) {
+        writerQueue.async { [writer] in writer.isMicrophoneMuted = muted }
+    }
+
     func pause(at time: CFTimeInterval) -> Bool {
         pauseClock.pause(at: time)
     }
@@ -264,6 +270,7 @@ final class ScreenRecorderService: ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var isPaused = false
     @Published private(set) var elapsedSeconds = 0
+    private var isMicrophoneMuted = false
     private var session: RecorderSession?
     private var indicator: RecorderIndicator?
     private var editors: [RecorderEditorController] = []
@@ -392,6 +399,7 @@ final class ScreenRecorderService: ObservableObject {
         guard prepareForSelection() else { return }
         let indicator = RecorderIndicator(
             onPause: { [weak self] in self?.togglePause() },
+            onToggleMicrophone: { [weak self] in self?.toggleMicrophoneMute() },
             onStop: { [weak self] in self?.stop() })
         indicator.showRegionGuide(for: region)
         self.indicator = indicator
@@ -505,11 +513,15 @@ final class ScreenRecorderService: ObservableObject {
         // the picture.
         let indicator = indicator ?? RecorderIndicator(
             onPause: { [weak self] in self?.togglePause() },
+            onToggleMicrophone: { [weak self] in self?.toggleMicrophoneMute() },
             onStop: { [weak self] in self?.stop() })
         indicator.show(on: NSScreen.screens.first { $0.displayID == region.displayID },
                        tooltip: strings.indicatorTooltip,
                        pauseTooltip: strings.pauseButton,
                        resumeTooltip: strings.resumeButton,
+                       showsMicrophone: session.capturesMicrophone,
+                       muteTooltip: strings.muteMicrophoneButton,
+                       unmuteTooltip: strings.unmuteMicrophoneButton,
                        stopTooltip: strings.stopButton)
         indicator.update(elapsed: RecorderSupport.elapsedLabel(seconds: 0))
         self.indicator = indicator
@@ -600,6 +612,13 @@ final class ScreenRecorderService: ObservableObject {
         indicator?.update(paused: isPaused)
     }
 
+    func toggleMicrophoneMute() {
+        guard isRecording, let session, session.capturesMicrophone else { return }
+        isMicrophoneMuted.toggle()
+        session.setMicrophoneMuted(isMicrophoneMuted)
+        indicator?.update(microphoneMuted: isMicrophoneMuted)
+    }
+
     /// A recording that fills the disk is a much worse failure than one that
     /// stopped early, so the free space is checked while it runs. Asking the
     /// system how much room is left has to account for purgeable files, which
@@ -652,6 +671,7 @@ final class ScreenRecorderService: ObservableObject {
     private func endRecordingSurfaces() {
         isRecording = false
         isPaused = false
+        isMicrophoneMuted = false
         elapsedTimer?.invalidate()
         elapsedTimer = nil
         if let sleepActivity {

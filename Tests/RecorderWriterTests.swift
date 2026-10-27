@@ -16,6 +16,7 @@ enum RecorderWriterTests {
                 try await check(suite, delayedVideo: true, changingMicrophone: true)
                 try await check(suite, changingMicrophone: true, microphoneChannels: 4)
                 try await check(suite, changingSystemAudio: true)
+                try await check(suite, mutingMicrophone: true)
             }
             catch { suite.expect(false, "recorder writer fixture failed: \(error)") }
             finished.signal()
@@ -46,7 +47,8 @@ enum RecorderWriterTests {
                               delayedVideo: Bool = false, capturesAudio: Bool = true,
                               changingMicrophone: Bool = false,
                               microphoneChannels: AVAudioChannelCount = 2,
-                               changingSystemAudio: Bool = false) async throws {
+                               changingSystemAudio: Bool = false,
+                              mutingMicrophone: Bool = false) async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("recorder-sync-\(UUID()).mov")
         defer { try? FileManager.default.removeItem(at: url) }
         let pause = RecorderPauseClock()
@@ -67,6 +69,8 @@ enum RecorderWriterTests {
             : firstAudio
         try await feed(firstMicrophone, kind: .microphone, to: writer, required: capturesAudio)
         for index in 0..<100 {
+            // Muted between the two markers: the voice keeps the first only.
+            if index == 60 { writer.isMicrophoneMuted = mutingMicrophone }
             if index == 50 {
                 pause.pause(at: 100.5)
                 suite.expect(pause.eventTime(100.75) == nil && pause.elapsed(at: 100.75) == 0.5,
@@ -120,6 +124,7 @@ enum RecorderWriterTests {
         let asset = AVURLAsset(url: url)
         let tracks = try await asset.load(.tracks)
         suite.expect(tracks.count == (capturesAudio ? 3 : 1), "the raw MOV contains exactly the enabled tracks")
+        let microphoneTrackID = await RecorderAudioSource.tracks(in: asset)[.microphone]?.trackID
         for track in tracks {
             let type = track.mediaType
             let range = try await track.load(.timeRange)
@@ -171,6 +176,11 @@ enum RecorderWriterTests {
                 }
             }
             suite.expect(reader.status == .completed, "the saved audio decodes fully")
+            if mutingMicrophone, track.trackID == microphoneTrackID {
+                suite.expect(markers.count == 1 && abs(markers[0] - 0.4) < 0.025,
+                       "a muted microphone writes silence, not its sound, for the rest of the take")
+                continue
+            }
             suite.expect(markers.count == 2 && abs(markers[0] - 0.4) < 0.025 && abs(markers[1] - 0.8) < 0.025,
                    "audio markers align with video before and after the pause")
             suite.expect(eventTimes.allSatisfy { event in markers.contains { abs($0 - event) < 0.025 } },
