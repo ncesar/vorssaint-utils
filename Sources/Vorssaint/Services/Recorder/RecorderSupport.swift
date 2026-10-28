@@ -331,9 +331,9 @@ enum RecorderSupport {
 
     // MARK: - Quality
 
-    /// Three named outcomes instead of a codec form. Exports are encoded at a
-    /// constant quality, so a still screen costs little; the take is still
-    /// written at a bit rate. Only Small trades pixels for size:
+    /// Three named outcomes instead of a codec form. Screen content is
+    /// low-entropy, so the encoder undershoots these ceilings hard, and the
+    /// ceiling only caps the busy moments. Only Small trades pixels for size:
     /// a recording is mostly text, and a picture written at two thirds and
     /// stretched back over the same display reads as blurry next to the
     /// system recorder, which keeps every pixel. Balanced keeps them too and
@@ -357,20 +357,6 @@ enum RecorderSupport {
             case .small: return 0.05
             case .balanced: return 0.06
             case .high: return 0.09
-            }
-        }
-
-        /// The encoder's constant quality for an export, 0 to 1. An average
-        /// bit rate is a target the hardware encoder fills even on a still
-        /// screen; a quality spends bits only where the picture changes.
-        /// Measured on real recordings: Balanced writes a mostly still
-        /// screen about ten times smaller than its bit rate did, and busy
-        /// zooms at the same size, without a visible loss.
-        var encoderQuality: Double {
-            switch self {
-            case .small: return 0.5
-            case .balanced: return 0.65
-            case .high: return 0.75
             }
         }
 

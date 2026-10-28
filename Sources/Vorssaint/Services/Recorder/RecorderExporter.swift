@@ -440,7 +440,10 @@ final class RecorderExporter {
         let width = Int(size.width)
         let height = Int(size.height)
         var compression: [String: Any] = [
-            AVVideoQualityKey: quality.encoderQuality,
+            AVVideoAverageBitRateKey: RecorderSupport.averageBitRate(width: width,
+                                                                     height: height,
+                                                                     fps: frameRate,
+                                                                     quality: quality),
             AVVideoExpectedSourceFrameRateKey: frameRate,
             AVVideoMaxKeyFrameIntervalDurationKey: quality.keyframeSeconds,
             AVVideoAllowFrameReorderingKey: false,
