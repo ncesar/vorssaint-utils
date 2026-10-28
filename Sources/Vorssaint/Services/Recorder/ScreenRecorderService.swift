@@ -88,7 +88,10 @@ private final class RecorderSession: NSObject, RecorderCaptureEngineDelegate {
             _ = startGate.claimStartFailure()
             return .writerFailed
         }
-        if capturesSystemAudio {
+        // A Bluetooth headset whose microphone is open turns into one call
+        // device for input and output, and the tap's aggregate device on top
+        // of it fills the voice with noise. The stream's sound is used then.
+        if capturesSystemAudio, !(microphone != nil && RecorderMicrophoneCapture.isBluetooth) {
             systemAudioTap = await RecorderSystemAudioTap.make(hearing: Self.windowOwner(of: region))
         }
         let tap = systemAudioTap

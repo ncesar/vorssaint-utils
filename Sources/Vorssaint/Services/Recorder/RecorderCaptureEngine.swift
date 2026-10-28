@@ -249,6 +249,13 @@ final class RecorderMicrophoneCapture: NSObject,
     private var targetClock: CMClock?
     private var configured = false
 
+    /// Whether the microphone a recording would open is a Bluetooth device.
+    static var isBluetooth: Bool {
+        guard let transport = AVCaptureDevice.default(for: .audio)?.transportType else { return false }
+        return UInt32(bitPattern: transport) == kAudioDeviceTransportTypeBluetooth
+            || UInt32(bitPattern: transport) == kAudioDeviceTransportTypeBluetoothLE
+    }
+
     func start(synchronizingTo clock: CMClock) async -> Bool {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
