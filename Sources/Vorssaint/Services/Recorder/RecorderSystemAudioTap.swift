@@ -79,6 +79,10 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
     private let heard = RecorderAudioFlag()
     /// The one app to hear, or nothing for the whole Mac.
     private let pid: pid_t?
+    /// Set while a Bluetooth microphone is recorded. The headset is then one
+    /// call device for input and output, and an aggregate built on it fills
+    /// the voice with noise, so the tap is read on the Mac's own speakers.
+    private let avoidsBluetoothHost: Bool
     private var tapID = AudioObjectID(0)
     private var tapUID = ""
     private var tapChannels = 2
@@ -102,21 +106,24 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
 
     /// The tap, or nothing when the audio system refuses one. A `pid` narrows
     /// it to that app's sound.
-    static func make(hearing pid: pid_t?) async -> RecorderSystemAudioTap? {
+    static func make(hearing pid: pid_t?,
+                     avoidsBluetoothHost: Bool) async -> RecorderSystemAudioTap? {
         guard #available(macOS 14.4, *) else { return nil }
         let queue = DispatchQueue(label: "com.vorssaint.recorder.systemaudio",
                                   qos: .userInitiated)
         return await withCheckedContinuation { continuation in
             queue.async {
-                continuation.resume(returning: RecorderSystemAudioTap(queue: queue, pid: pid))
+                continuation.resume(returning: RecorderSystemAudioTap(queue: queue, pid: pid,
+                                                                   avoidsBluetoothHost: avoidsBluetoothHost))
             }
         }
     }
 
     @available(macOS 14.4, *)
-    private init?(queue: DispatchQueue, pid: pid_t?) {
+    private init?(queue: DispatchQueue, pid: pid_t?, avoidsBluetoothHost: Bool) {
         self.queue = queue
         self.pid = pid
+        self.avoidsBluetoothHost = avoidsBluetoothHost
         guard buildTap() else { return nil }
     }
 
@@ -209,7 +216,7 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
     /// volume mixer does.
     private func buildPipeline() {
         guard aggregateID == 0, let clock,
-              let hostUID = Self.hostDeviceUID() else { return }
+              let hostUID = hostDeviceUIDNow() else { return }
         let aggregate: [String: Any] = [
             kAudioAggregateDeviceNameKey: "Vorssaint Recorder",
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
@@ -297,7 +304,7 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
     /// rebuild itself raises settle instead of looping.
     private func rebuildPipelineIfChanged() {
         guard !stopped, aggregateID != 0 else { return }
-        let hostChanged = Self.hostDeviceUID() != hostDeviceUID
+        let hostChanged = hostDeviceUIDNow() != hostDeviceUID
         let rateChanged = Self.nominalSampleRate(of: aggregateID) != sampleRate
         guard hostChanged || rateChanged else { return }
         teardownPipeline()
@@ -506,13 +513,43 @@ final class RecorderSystemAudioTap: @unchecked Sendable {
     /// same choice the volume mixer makes. A device that also records puts
     /// its input in front of the tap in the buffer list, which the shared
     /// `MixerRender.tapBufferIndex` already steps over.
-    private static func hostDeviceUID() -> String? {
-        var defaultDevice = AudioObjectID(0)
-        guard read(AudioObjectID(kAudioObjectSystemObject),
-                   kAudioHardwarePropertyDefaultOutputDevice, &defaultDevice),
-              defaultDevice != 0 else { return nil }
+    private func hostDeviceUIDNow() -> String? {
+        var device = AudioObjectID(0)
+        guard Self.read(AudioObjectID(kAudioObjectSystemObject),
+                        kAudioHardwarePropertyDefaultOutputDevice, &device),
+              device != 0 else { return nil }
+        if avoidsBluetoothHost, Self.isBluetooth(device) {
+            guard let builtIn = Self.builtInOutputDevice() else { return nil }
+            device = builtIn
+        }
         var uid: CFString = "" as CFString
-        guard read(defaultDevice, kAudioDevicePropertyDeviceUID, &uid) else { return nil }
+        guard Self.read(device, kAudioDevicePropertyDeviceUID, &uid) else { return nil }
         return uid as String
+    }
+
+    private static func isBluetooth(_ device: AudioObjectID) -> Bool {
+        var transport: UInt32 = 0
+        guard read(device, kAudioDevicePropertyTransportType, &transport) else { return false }
+        return transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
+    }
+
+    /// The Mac's own speakers, or nothing on a Mac without any.
+    private static func builtInOutputDevice() -> AudioObjectID? {
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        var list = address(kAudioHardwarePropertyDevices)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(system, &list, 0, nil, &size) == noErr else { return nil }
+        var devices = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(system, &list, 0, nil, &size, &devices) == noErr else { return nil }
+        return devices.first { device in
+            var transport: UInt32 = 0
+            var streams = address(kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeOutput)
+            var streamBytes: UInt32 = 0
+            return read(device, kAudioDevicePropertyTransportType, &transport)
+                && transport == kAudioDeviceTransportTypeBuiltIn
+                && AudioObjectGetPropertyDataSize(device, &streams, 0, nil, &streamBytes) == noErr
+                && streamBytes > 0
+        }
     }
 }
