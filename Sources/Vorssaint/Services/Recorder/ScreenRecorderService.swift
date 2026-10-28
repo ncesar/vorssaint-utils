@@ -168,6 +168,13 @@ private final class RecorderSession: NSObject, RecorderCaptureEngineDelegate {
               let pid = (info.first?[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
               pid != ProcessInfo.processInfo.processIdentifier
         else { return nil }
+        // A browser's web app draws its window from a small app shim, but its
+        // sound comes from the browser's own helpers, so the browser is heard.
+        if let shim = NSRunningApplication(processIdentifier: pid)?.bundleURL.flatMap(Bundle.init(url:)),
+           let browser = shim.object(forInfoDictionaryKey: "CrBundleIdentifier") as? String,
+           let host = NSRunningApplication.runningApplications(withBundleIdentifier: browser).first {
+            return host.processIdentifier
+        }
         return pid
     }
 
